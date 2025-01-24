@@ -1,2 +1,2 @@
 # aika
-discrete event simulator for stable rust! (tired of using nightly just for the coroutines smh)
+discrete event simulation manager for stable rust!
