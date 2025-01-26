@@ -1,22 +1,21 @@
-use core::num;
-use std::any::Any;
 use anyhow::Result;
-use tokio::sync::watch;
-use std::sync::{Arc, Mutex};
-use std::collections::{BinaryHeap, HashMap};
+use futures::future::BoxFuture;
+use std::any::Any;
 use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use futures::future::BoxFuture;
-use tokio::sync::mpsc::{channel, Sender, Receiver, error};
-use uuid::Uuid;
+use tokio::sync::mpsc::{channel, error, Receiver, Sender};
+use tokio::sync::watch;
+
+use crate::logger::Logger;
 
 pub struct Message {
     data: Box<dyn Any + Send + Sync>,
     timestamp: f64,
     from: usize,
     to: usize,
-
 }
 
 impl PartialEq for Message {
@@ -87,10 +86,20 @@ impl Mailbox {
 }
 
 pub trait Agent: Send {
-    fn step<'a>(&'a mut self, state: &'a mut Option<State>, time: f64, mailbox: &'a mut Mailbox) -> BoxFuture<'a, Event>;
+    fn step<'a>(
+        &'a mut self,
+        state: &'a mut Option<State>,
+        time: f64,
+        mailbox: &'a mut Mailbox,
+    ) -> BoxFuture<'a, Event>;
+    fn as_any(&self) -> &dyn Any;
 }
 
-// Shared state between agents
+pub trait Loggable: Agent {
+    fn get_state(&self) -> State;
+}
+
+// Thread-safe loggable generic state type
 pub type State = Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>;
 
 #[derive(Clone, Debug)]
@@ -118,7 +127,6 @@ impl Event {
     }
 }
 
-
 impl PartialEq for Event {
     fn eq(&self, other: &Self) -> bool {
         self.time == other.time
@@ -145,6 +153,7 @@ struct Time {
     terminal: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
 pub enum SimError {
     TimeTravel,
     PastTerminal,
@@ -153,23 +162,28 @@ pub enum SimError {
 
 pub struct World {
     pending: BinaryHeap<Reverse<Event>>,
-    logged: BinaryHeap<Event>,
     savedmail: BinaryHeap<Message>,
     agents: Vec<Box<dyn Agent>>,
     mailbox: Mailbox,
     time: Time,
     state: Option<State>,
-    sender: Sender<Event>,
+    pub sender: Sender<Event>,
     runtime: Receiver<Event>,
     pause_tx: watch::Sender<bool>,
     pause_rx: watch::Receiver<bool>,
+    logger: Logger,
 }
 
 unsafe impl Send for World {}
 unsafe impl Sync for World {}
 
 impl World {
-    pub fn create(timestep: f64, terminal: Option<f64>, buffer_size: usize, mailbox_size: usize) -> Self {
+    pub fn create(
+        timestep: f64,
+        terminal: Option<f64>,
+        buffer_size: usize,
+        mailbox_size: usize,
+    ) -> Self {
         let (sim_tx, sim_rx) = channel(buffer_size);
         let time = Time {
             time: 0.0,
@@ -182,7 +196,6 @@ impl World {
         let mailbox = Mailbox::new(mailbox_size, pause_rx.clone());
         World {
             pending: BinaryHeap::new(),
-            logged: BinaryHeap::new(),
             savedmail: BinaryHeap::new(),
             agents: Vec::new(),
             mailbox,
@@ -192,6 +205,7 @@ impl World {
             runtime: sim_rx,
             pause_tx,
             pause_rx,
+            logger: Logger::new(),
         }
     }
 
@@ -208,7 +222,8 @@ impl World {
         self.pause_tx.send(false).unwrap();
     }
 
-    pub async fn run(&mut self, live: bool) -> Result<(), SimError> {
+    pub async fn run(&mut self, live: bool, logs: bool) -> Result<(), SimError> {
+        println!("[*] starting world simulation");
         loop {
             if *self.pause_rx.borrow() {
                 self.pause_rx.changed().await.unwrap();
@@ -219,11 +234,14 @@ impl World {
             }
             if let Some(event) = self.pending.pop() {
                 if live {
-                    thread::sleep(Duration::from_millis((self.time.timestep * 1000.0 / self.time.timescale) as u64));
+                    tokio::time::sleep(Duration::from_millis(
+                        (self.time.timestep * 1000.0 / self.time.timescale) as u64,
+                    ))
+                    .await;
                 }
                 let event = event.0;
                 if event.time > self.time.terminal.unwrap_or(f64::INFINITY) {
-                    return Err(SimError::PastTerminal);
+                    break;
                 }
                 if event.time < self.time.time {
                     return Err(SimError::TimeTravel);
@@ -232,30 +250,47 @@ impl World {
                 self.time.time = event.time;
                 self.time.step += 1;
                 let agent = &mut self.agents[event.agent];
-                let event = agent.step(&mut self.state, event.time.clone(), &mut self.mailbox).await;
+                let event = agent
+                    .step(&mut self.state, event.time.clone(), &mut self.mailbox)
+                    .await;
                 match event.yield_ {
                     Action::Timeout(time) => {
-                        self.pending.push(Reverse(Event::new(self.time.time + time, event.agent, Action::Wait)));
+                        self.pending.push(Reverse(Event::new(
+                            self.time.time + time,
+                            event.agent,
+                            Action::Wait,
+                        )));
                     }
                     Action::Schedule(time) => {
-                        self.pending.push(Reverse(Event::new(time, event.agent, Action::Wait)));
+                        self.pending
+                            .push(Reverse(Event::new(time, event.agent, Action::Wait)));
                     }
-                    Action::Trigger { time, idx  } => {
-                        self.pending.push(Reverse(Event::new(time, idx, Action::Wait)));
+                    Action::Trigger { time, idx } => {
+                        self.pending
+                            .push(Reverse(Event::new(time, idx, Action::Wait)));
                     }
-                    Action::Wait => {
-                
-                    }
+                    Action::Wait => {}
                 }
-                self.logged.push(event);
-                continue;
+                if logs {
+                    let mut agent_states = BTreeMap::new();
+                    for (i, agt) in self.agents.iter().enumerate() {
+                        if let Some(loggable) = agt.as_any().downcast_ref::<Box<dyn Loggable>>() {
+                            agent_states.insert(i, Some(loggable.get_state()));
+                        }
+                        agent_states.insert(i, None);
+                    }
+                    self.logger
+                        .log(self.now(), self.state.clone(), agent_states, event.clone());
+                }
+            } else {
+                if let Some(event) = self.runtime.recv().await {
+                    self.pending.push(Reverse(event));
+                } else {
+                    break;
+                }
             }
-            if let Some(event) = self.runtime.recv().await {
-                self.pending.push(Reverse(event));
-                continue;
-            }
-            break;
         }
+        println!("[+] simulation complete");
         Ok(())
     }
 
@@ -267,22 +302,32 @@ impl World {
         self.time.step
     }
 
-    async fn schedule(sender: Sender<Event>, time: f64, agent: usize) -> Result<(), error::SendError<Event>> {
-        sender.send(Event::new(time, agent, Action::Wait)).await
-    }
-
     pub fn block_agent(&mut self, idx: usize, until: Option<f64>) {
         if until.is_none() {
             self.pending.retain(|x| x.0.agent != idx);
         }
-        self.pending.retain(|x| x.0.agent != idx && x.0.time < until.unwrap());
+        self.pending
+            .retain(|x| x.0.agent != idx && x.0.time < until.unwrap());
     }
 
     pub fn remove_event(&mut self, idx: usize, time: f64) {
-        self.pending.retain(|x| x.0.agent != idx && x.0.time != time);
+        self.pending
+            .retain(|x| x.0.agent != idx && x.0.time != time);
     }
 
     pub fn log_mail(&mut self, msg: Message) {
         self.savedmail.push(msg);
     }
+
+    pub fn rescale_time(&mut self, timescale: f64) {
+        self.time.timescale = timescale;
+    }
+}
+
+pub async fn schedule(
+    sender: Sender<Event>,
+    time: f64,
+    agent: usize,
+) -> Result<(), error::SendError<Event>> {
+    sender.send(Event::new(time, agent, Action::Wait)).await
 }

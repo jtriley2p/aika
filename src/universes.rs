@@ -1,7 +1,7 @@
 use crate::worlds::SimError;
 use anyhow::Result;
-use rayon::prelude::*;
 use futures::executor::block_on;
+use rayon::prelude::*;
 
 use super::worlds::*;
 
@@ -11,31 +11,27 @@ pub struct Universe {
 
 impl Universe {
     pub fn new() -> Self {
-        Universe {
-            worlds: Vec::new(),
-        }
+        Universe { worlds: Vec::new() }
     }
-    
+
     pub fn add_world(&mut self, world: World) {
         self.worlds.push(world);
     }
 
-    pub fn run_parallel(&mut self, live: bool) -> Result<Vec<Result<(), SimError>>> {
-        let results: Vec<_> = self.worlds.par_iter_mut()
-            .map(|world| {
-                block_on(world.run(live))
-            })
+    pub fn run_parallel(&mut self, live: bool, logs: bool) -> Result<Vec<Result<(), SimError>>> {
+        let results: Vec<_> = self
+            .worlds
+            .par_iter_mut()
+            .map(|world| block_on(world.run(live, logs)))
             .collect();
         Ok(results)
     }
 
     pub fn pause_all(&mut self) {
-        self.worlds.par_iter()
-            .for_each(|world| world.pause());
+        self.worlds.par_iter().for_each(|world| world.pause());
     }
 
     pub fn resume_all(&mut self) {
-        self.worlds.par_iter()
-            .for_each(|world| world.resume());
+        self.worlds.par_iter().for_each(|world| world.resume());
     }
 }
