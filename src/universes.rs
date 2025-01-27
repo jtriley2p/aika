@@ -1,7 +1,6 @@
 use crate::worlds::SimError;
 use anyhow::Result;
-use futures::executor::block_on;
-use rayon::prelude::*;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::worlds::*;
 
@@ -18,20 +17,53 @@ impl Universe {
         self.worlds.push(world);
     }
 
-    pub fn run_parallel(&mut self, live: bool, logs: bool) -> Result<Vec<Result<(), SimError>>> {
-        let results: Vec<_> = self
-            .worlds
-            .par_iter_mut()
-            .map(|world| block_on(world.run(live, logs)))
+    pub async fn run_parallel(
+        &mut self,
+        live: bool,
+        logs: bool,
+    ) -> Result<Vec<Result<(), SimError>>> {
+        let mut handles = vec![];
+        let worlds = std::mem::take(&mut self.worlds);
+        for mut world in worlds {
+            let handle = tokio::spawn(async move { world.run(live, logs).await });
+            handles.push(handle);
+        }
+        let results = futures::future::join_all(handles).await;
+        let results = results
+            .into_iter()
+            .map(|result| match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(SimError::TokioError(e.to_string())),
+            })
             .collect();
+
         Ok(results)
     }
 
-    pub fn pause_all(&mut self) {
-        self.worlds.par_iter().for_each(|world| world.pause());
+    pub fn pause_all(&mut self) -> Result<(), Vec<SimError>> {
+        let errors: Vec<_> = self
+            .worlds
+            .par_iter()
+            .filter_map(|world| world.pause().err())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
-    pub fn resume_all(&mut self) {
-        self.worlds.par_iter().for_each(|world| world.resume());
+    pub fn resume_all(&mut self) -> Result<(), Vec<SimError>> {
+        let errors: Vec<_> = self
+            .worlds
+            .par_iter()
+            .filter_map(|world| world.resume().err())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }

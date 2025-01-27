@@ -2,20 +2,21 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 use std::any::Any;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc::{channel, error, Receiver, Sender};
 use tokio::sync::watch;
 
 use crate::logger::Logger;
 
 pub struct Message {
-    data: Box<dyn Any + Send + Sync>,
-    timestamp: f64,
-    from: usize,
-    to: usize,
+    pub data: Box<dyn Any + Send + Sync>,
+    pub timestamp: f64,
+    pub from: usize,
+    pub to: usize,
 }
 
 impl PartialEq for Message {
@@ -108,6 +109,7 @@ pub enum Action {
     Schedule(f64),
     Trigger { time: f64, idx: usize },
     Wait,
+    Break,
 }
 
 #[derive(Clone, Debug)]
@@ -158,20 +160,31 @@ pub enum SimError {
     TimeTravel,
     PastTerminal,
     NoState,
+    ScheduleFailed,
+    PauseError,
+    InvalidIndex,
+    TokioError(String),
+}
+
+pub enum ControlCommand {
+    Pause,
+    Resume,
+    SetTimeScale(f64),
+    Quit,
 }
 
 pub struct World {
-    pending: BinaryHeap<Reverse<Event>>,
-    savedmail: BinaryHeap<Message>,
+    pending: BTreeSet<Reverse<Event>>,
+    savedmail: BTreeSet<Message>,
     agents: Vec<Box<dyn Agent>>,
     mailbox: Mailbox,
     time: Time,
     state: Option<State>,
     pub sender: Sender<Event>,
     runtime: Receiver<Event>,
-    pause_tx: watch::Sender<bool>,
-    pause_rx: watch::Receiver<bool>,
-    logger: Logger,
+    pub pause_tx: watch::Sender<bool>,
+    pub pause_rx: watch::Receiver<bool>,
+    pub logger: Logger,
 }
 
 unsafe impl Send for World {}
@@ -195,8 +208,8 @@ impl World {
         let (pause_tx, pause_rx) = watch::channel(false);
         let mailbox = Mailbox::new(mailbox_size, pause_rx.clone());
         World {
-            pending: BinaryHeap::new(),
-            savedmail: BinaryHeap::new(),
+            pending: BTreeSet::new(),
+            savedmail: BTreeSet::new(),
             agents: Vec::new(),
             mailbox,
             time,
@@ -214,25 +227,76 @@ impl World {
         self.agents.len() - 1
     }
 
-    pub fn pause(&self) {
-        self.pause_tx.send(true).unwrap();
+    pub fn pause(&self) -> Result<(), SimError> {
+        let pause = self.pause_tx.send(true);
+        if pause.is_err() {
+            return Err(SimError::PauseError);
+        }
+        Ok(())
     }
 
-    pub fn resume(&self) {
-        self.pause_tx.send(false).unwrap();
+    pub fn resume(&self) -> Result<(), SimError> {
+        let resume = self.pause_tx.send(false);
+        if resume.is_err() {
+            return Err(SimError::PauseError);
+        }
+        Ok(())
     }
 
     pub async fn run(&mut self, live: bool, logs: bool) -> Result<(), SimError> {
         println!("[*] starting world simulation");
+        // Command line interface for real-time simulation
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(100);
+        if live {
+            let cmd_tx_clone = cmd_tx.clone();
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).await.is_ok() {
+                        let cmd = match line.trim() {
+                            "pause" => ControlCommand::Pause,
+                            "resume" => ControlCommand::Resume,
+                            "quit" => ControlCommand::Quit,
+                            cmd if cmd.starts_with("speed ") => {
+                                if let Some(scale) = cmd
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .and_then(|s| Some(s.parse::<f64>().unwrap()))
+                                {
+                                    ControlCommand::SetTimeScale(scale)
+                                } else {
+                                    continue;
+                                }
+                            }
+                            _ => continue,
+                        };
+                        if cmd_tx_clone.send(cmd).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         loop {
+            if let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    ControlCommand::Pause => self.pause()?,
+                    ControlCommand::Resume => self.resume()?,
+                    ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                    ControlCommand::Quit => break,
+                }
+            }
             if *self.pause_rx.borrow() {
                 self.pause_rx.changed().await.unwrap();
                 continue;
             }
             while let Ok(event) = self.runtime.try_recv() {
-                self.pending.push(Reverse(event));
+                self.pending.insert(Reverse(event));
             }
-            if let Some(event) = self.pending.pop() {
+            if let Some(event) = self.pending.pop_first() {
                 if live {
                     tokio::time::sleep(Duration::from_millis(
                         (self.time.timestep * 1000.0 / self.time.timescale) as u64,
@@ -253,24 +317,6 @@ impl World {
                 let event = agent
                     .step(&mut self.state, event.time.clone(), &mut self.mailbox)
                     .await;
-                match event.yield_ {
-                    Action::Timeout(time) => {
-                        self.pending.push(Reverse(Event::new(
-                            self.time.time + time,
-                            event.agent,
-                            Action::Wait,
-                        )));
-                    }
-                    Action::Schedule(time) => {
-                        self.pending
-                            .push(Reverse(Event::new(time, event.agent, Action::Wait)));
-                    }
-                    Action::Trigger { time, idx } => {
-                        self.pending
-                            .push(Reverse(Event::new(time, idx, Action::Wait)));
-                    }
-                    Action::Wait => {}
-                }
                 if logs {
                     let mut agent_states = BTreeMap::new();
                     for (i, agt) in self.agents.iter().enumerate() {
@@ -282,9 +328,38 @@ impl World {
                     self.logger
                         .log(self.now(), self.state.clone(), agent_states, event.clone());
                 }
+                match event.yield_ {
+                    Action::Timeout(time) => {
+                        self.pending.insert(Reverse(Event::new(
+                            self.time.time + time,
+                            event.agent,
+                            Action::Wait,
+                        )));
+                    }
+                    Action::Schedule(time) => {
+                        self.pending
+                            .insert(Reverse(Event::new(time, event.agent, Action::Wait)));
+                    }
+                    Action::Trigger { time, idx } => {
+                        self.pending
+                            .insert(Reverse(Event::new(time, idx, Action::Wait)));
+                    }
+                    Action::Wait => {}
+                    Action::Break => {
+                        break;
+                    }
+                }
+                if let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        ControlCommand::Pause => self.pause()?,
+                        ControlCommand::Resume => self.resume()?,
+                        ControlCommand::Quit => break,
+                        ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                    }
+                }
             } else {
                 if let Some(event) = self.runtime.recv().await {
-                    self.pending.push(Reverse(event));
+                    self.pending.insert(Reverse(event));
                 } else {
                     break;
                 }
@@ -302,32 +377,56 @@ impl World {
         self.time.step
     }
 
-    pub fn block_agent(&mut self, idx: usize, until: Option<f64>) {
+    pub fn block_agent(&mut self, idx: usize, until: Option<f64>) -> Result<(), SimError> {
+        if self.agents.len() <= idx {
+            return Err(SimError::InvalidIndex);
+        }
         if until.is_none() {
             self.pending.retain(|x| x.0.agent != idx);
         }
         self.pending
             .retain(|x| x.0.agent != idx && x.0.time < until.unwrap());
+        Ok(())
     }
 
-    pub fn remove_event(&mut self, idx: usize, time: f64) {
+    pub fn remove_event(&mut self, idx: usize, time: f64) -> Result<(), SimError> {
+        if self.agents.len() <= idx {
+            return Err(SimError::InvalidIndex);
+        } else if self.time.time > time {
+            return Err(SimError::TimeTravel);
+        }
         self.pending
             .retain(|x| x.0.agent != idx && x.0.time != time);
+        Ok(())
     }
 
     pub fn log_mail(&mut self, msg: Message) {
-        self.savedmail.push(msg);
+        self.savedmail.insert(msg);
     }
 
     pub fn rescale_time(&mut self, timescale: f64) {
         self.time.timescale = timescale;
     }
-}
 
-pub async fn schedule(
-    sender: Sender<Event>,
-    time: f64,
-    agent: usize,
-) -> Result<(), error::SendError<Event>> {
-    sender.send(Event::new(time, agent, Action::Wait)).await
+    pub fn check_status(&self) -> bool {
+        self.pause_rx.borrow().clone()
+    }
+
+    pub async fn schedule(
+        &self,
+        sender: Sender<Event>,
+        time: f64,
+        agent: usize,
+    ) -> Result<(), SimError> {
+        if time < self.time.time {
+            return Err(SimError::TimeTravel);
+        } else if time > self.time.terminal.unwrap_or(f64::INFINITY) {
+            return Err(SimError::PastTerminal);
+        }
+        let result = sender.send(Event::new(time, agent, Action::Wait)).await;
+        if result.is_err() {
+            return Err(SimError::ScheduleFailed);
+        }
+        Ok(())
+    }
 }

@@ -1,5 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use futures::future::BoxFuture;
-use worlds::{Action, Agent, Event, Mailbox, State};
+use worlds::{Action, Agent, Event, Loggable, Mailbox, Message, State};
 
 extern crate tokio;
 
@@ -35,17 +37,25 @@ impl Agent for TestAgent {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::worlds::*;
     use super::*;
     use tokio::*;
 
+    #[derive(Debug)]
+    enum ControlCommand {
+        Pause,
+        Resume,
+        Stop,
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn test_run() {
-        let mut world = World::create(1.0, Some(20.0), 100, 100);
+    async fn test_offline_run() {
+        let mut world = World::create(1.0, Some(2000000.0), 100, 100);
         let agent_test = TestAgent::new(0, "Test".to_string());
         world.spawn(Box::new(agent_test));
-        world.rescale_time(5.0);
-        schedule(world.sender.clone(), 0.0, 0).await.unwrap();
-        assert!(world.run(true, false).await.unwrap() == ());
+        world.schedule(world.sender.clone(), 0.0, 0).await.unwrap();
+        assert!(world.run(false, false).await.unwrap() == ());
     }
 }
