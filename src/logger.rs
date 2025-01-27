@@ -7,7 +7,7 @@ use crate::worlds::{Event, State};
 pub struct Snapshot {
     timestamp: f64,
     shared_state: Option<State>,
-    agent_states: BTreeMap<usize, Option<State>>,
+    agent_states: BTreeMap<usize, State>,
 }
 
 impl PartialEq for Snapshot {
@@ -47,7 +47,7 @@ impl Logger {
         &mut self,
         timestamp: f64,
         shared_state: Option<State>,
-        agent_states: BTreeMap<usize, Option<State>>,
+        agent_states: BTreeMap<usize, State>,
         event: Event,
     ) {
         self.snapshots.push(Snapshot {

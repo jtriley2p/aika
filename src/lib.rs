@@ -24,10 +24,10 @@ impl Agent for TestAgent {
     fn step<'a>(
         &'a mut self,
         state: &'a mut Option<State>,
-        time: f64,
+        time: &f64,
         mailbox: &'a mut Mailbox,
     ) -> BoxFuture<'a, Event> {
-        let event = Event::new(time, self.id, Action::Timeout(1.0));
+        let event = Event::new(*time, self.id, Action::Timeout(1.0));
         Box::pin(async { event })
     }
     fn as_any(&self) -> &dyn std::any::Any {
@@ -41,14 +41,6 @@ mod tests {
 
     use super::worlds::*;
     use super::*;
-    use tokio::*;
-
-    #[derive(Debug)]
-    enum ControlCommand {
-        Pause,
-        Resume,
-        Stop,
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_offline_run() {

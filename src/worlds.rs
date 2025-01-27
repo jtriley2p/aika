@@ -90,7 +90,7 @@ pub trait Agent: Send {
     fn step<'a>(
         &'a mut self,
         state: &'a mut Option<State>,
-        time: f64,
+        time: &f64,
         mailbox: &'a mut Mailbox,
     ) -> BoxFuture<'a, Event>;
     fn as_any(&self) -> &dyn Any;
@@ -244,7 +244,6 @@ impl World {
     }
 
     pub async fn run(&mut self, live: bool, logs: bool) -> Result<(), SimError> {
-        println!("[*] starting world simulation");
         // Command line interface for real-time simulation
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(100);
         if live {
@@ -290,10 +289,10 @@ impl World {
                         ControlCommand::Quit => break,
                     }
                 }
-            }
-            if *self.pause_rx.borrow() {
-                self.pause_rx.changed().await.unwrap();
-                continue;
+                if *self.pause_rx.borrow() {
+                    self.pause_rx.changed().await.unwrap();
+                    continue;
+                }
             }
             while let Ok(event) = self.runtime.try_recv() {
                 self.pending.insert(Reverse(event));
@@ -317,16 +316,19 @@ impl World {
                 self.time.step += 1;
                 let agent = &mut self.agents[event.agent];
                 let event = agent
-                    .step(&mut self.state, event.time.clone(), &mut self.mailbox)
+                    .step(&mut self.state, &event.time, &mut self.mailbox)
                     .await;
                 if logs {
-                    let mut agent_states = BTreeMap::new();
-                    for (i, agt) in self.agents.iter().enumerate() {
-                        if let Some(loggable) = agt.as_any().downcast_ref::<Box<dyn Loggable>>() {
-                            agent_states.insert(i, Some(loggable.get_state()));
-                        }
-                        agent_states.insert(i, None);
-                    }
+                    let agent_states: BTreeMap<usize, Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>> =
+                        self.agents
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, agt)| {
+                                agt.as_any()
+                                    .downcast_ref::<Box<dyn Loggable>>()
+                                    .map(|loggable| (i, loggable.get_state()))
+                            })
+                            .collect();
                     self.logger
                         .log(self.now(), self.state.clone(), agent_states, event.clone());
                 }
@@ -369,7 +371,6 @@ impl World {
                 }
             }
         }
-        println!("[+] simulation complete");
         Ok(())
     }
 
