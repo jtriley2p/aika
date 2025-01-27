@@ -281,12 +281,14 @@ impl World {
         }
 
         loop {
-            if let Some(cmd) = cmd_rx.recv().await {
-                match cmd {
-                    ControlCommand::Pause => self.pause()?,
-                    ControlCommand::Resume => self.resume()?,
-                    ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
-                    ControlCommand::Quit => break,
+            if live {
+                if let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        ControlCommand::Pause => self.pause()?,
+                        ControlCommand::Resume => self.resume()?,
+                        ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                        ControlCommand::Quit => break,
+                    }
                 }
             }
             if *self.pause_rx.borrow() {
@@ -349,12 +351,14 @@ impl World {
                         break;
                     }
                 }
-                if let Ok(cmd) = cmd_rx.try_recv() {
-                    match cmd {
-                        ControlCommand::Pause => self.pause()?,
-                        ControlCommand::Resume => self.resume()?,
-                        ControlCommand::Quit => break,
-                        ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                if live {
+                    if let Some(cmd) = cmd_rx.recv().await {
+                        match cmd {
+                            ControlCommand::Pause => self.pause()?,
+                            ControlCommand::Resume => self.resume()?,
+                            ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                            ControlCommand::Quit => break,
+                        }
                     }
                 }
             } else {
