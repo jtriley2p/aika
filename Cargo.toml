@@ -3,6 +3,11 @@ name = "aika"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "realtime"
+path = "examples/realtime.rs"
+
+
 [dependencies]
 tokio = {version = "1.43.0", features = ["full", "time", "sync", "rt", "rt-multi-thread"]}
 tokio-macros = "2.5.0"

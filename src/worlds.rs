@@ -171,6 +171,7 @@ pub enum ControlCommand {
     Resume,
     SetTimeScale(f64),
     Quit,
+    Schedule(f64, usize),
 }
 
 pub struct World {
@@ -246,25 +247,39 @@ impl World {
     pub async fn run(&mut self, live: bool, logs: bool) -> Result<(), SimError> {
         // Command line interface for real-time simulation
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(100);
+
         if live {
+            // Spawn a single continuous CLI task
             let cmd_tx_clone = cmd_tx.clone();
             tokio::spawn(async move {
                 let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-                let mut line = String::new();
                 loop {
-                    line.clear();
+                    let mut line = String::new();
                     if reader.read_line(&mut line).await.is_ok() {
                         let cmd = match line.trim() {
                             "pause" => ControlCommand::Pause,
                             "resume" => ControlCommand::Resume,
                             "quit" => ControlCommand::Quit,
                             cmd if cmd.starts_with("speed ") => {
-                                if let Some(scale) = cmd
-                                    .split_whitespace()
-                                    .nth(1)
-                                    .and_then(|s| Some(s.parse::<f64>().unwrap()))
+                                if let Some(scale) = cmd.split_whitespace().nth(1)
+                                    .and_then(|s| s.parse::<f64>().ok()) 
                                 {
                                     ControlCommand::SetTimeScale(scale)
+                                } else {
+                                    continue;
+                                }
+                            }
+                            cmd if cmd.starts_with("schedule ") => {
+                                let parts: Vec<_> = cmd.split_whitespace().collect();
+                                if parts.len() >= 3 {
+                                    if let (Some(time), Some(idx)) = (
+                                        parts[1].parse::<f64>().ok(),
+                                        parts[2].parse::<usize>().ok(),
+                                    ) {
+                                        ControlCommand::Schedule(time, idx)
+                                    } else {
+                                        continue;
+                                    }
                                 } else {
                                     continue;
                                 }
@@ -272,25 +287,49 @@ impl World {
                             _ => continue,
                         };
                         if cmd_tx_clone.send(cmd).await.is_err() {
-                            break;
+                            break; // Exit if the channel is closed
                         }
+                    } else {
+                        break; // Exit on read error
                     }
                 }
             });
         }
-
         loop {
             if live {
-                if let Some(cmd) = cmd_rx.recv().await {
+                while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         ControlCommand::Pause => self.pause()?,
                         ControlCommand::Resume => self.resume()?,
                         ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
                         ControlCommand::Quit => break,
+                        ControlCommand::Schedule(time, idx) => {
+                            self.pending
+                                .insert(Reverse(Event::new(time, idx, Action::Wait)));
+                        }
                     }
                 }
                 if *self.pause_rx.borrow() {
-                    self.pause_rx.changed().await.unwrap();
+                    // Wait for either a state change or new commands
+                    tokio::select! {
+                        // Pause state changed (e.g., resumed)
+                        _ = self.pause_rx.changed() => {},
+                        // New command received (e.g., "resume")
+                        cmd = cmd_rx.recv() => {
+                            if let Some(cmd) = cmd {
+                                match cmd {
+                                    ControlCommand::Pause => self.pause()?,
+                                    ControlCommand::Resume => self.resume()?,
+                                    ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                                    ControlCommand::Quit => break,
+                                    ControlCommand::Schedule(time, idx) => {
+                                        self.pending.insert(Reverse(Event::new(time, idx, Action::Wait)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Re-check the loop after handling
                     continue;
                 }
             }
@@ -354,12 +393,16 @@ impl World {
                     }
                 }
                 if live {
-                    if let Some(cmd) = cmd_rx.recv().await {
+                    while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             ControlCommand::Pause => self.pause()?,
                             ControlCommand::Resume => self.resume()?,
                             ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
                             ControlCommand::Quit => break,
+                            ControlCommand::Schedule(time, idx) => {
+                                self.pending
+                                    .insert(Reverse(Event::new(time, idx, Action::Wait)));
+                            }
                         }
                     }
                 }
