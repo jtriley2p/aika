@@ -27,7 +27,6 @@ impl Agent for TestAgent {
         time: &f64,
         mailbox: &'a mut Mailbox,
     ) -> BoxFuture<'a, Event> {
-        println!("{}: {}", *time, self.name);
         let event = Event::new(*time, self.id, Action::Timeout(1.0));
         Box::pin(async { event })
     }
