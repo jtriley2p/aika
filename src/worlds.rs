@@ -160,9 +160,11 @@ struct Time {
 pub enum SimError {
     TimeTravel,
     PastTerminal,
-    NoState,
     ScheduleFailed,
-    PauseError,
+    PlaybackFroze,
+    NoState,
+    NoEvents,
+    NoClock,
     InvalidIndex,
     TokioError(String),
 }
@@ -210,9 +212,10 @@ impl World {
         };
         let (pause_tx, pause_rx) = watch::channel(false);
         let mailbox = Mailbox::new(mailbox_size, pause_rx.clone());
+        println!("World created");
         World {
             overflow: BTreeSet::new(),
-            clock: Clock::new(256, 1),
+            clock: Clock::new(256, 1).unwrap(),
             savedmail: BTreeSet::new(),
             agents: Vec::new(),
             mailbox,
@@ -234,7 +237,7 @@ impl World {
     pub fn pause(&self) -> Result<(), SimError> {
         let pause = self.pause_tx.send(true);
         if pause.is_err() {
-            return Err(SimError::PauseError);
+            return Err(SimError::PlaybackFroze);
         }
         Ok(())
     }
@@ -242,15 +245,14 @@ impl World {
     pub fn resume(&self) -> Result<(), SimError> {
         let resume = self.pause_tx.send(false);
         if resume.is_err() {
-            return Err(SimError::PauseError);
+            return Err(SimError::PlaybackFroze);
         }
         Ok(())
     }
 
     pub async fn run(&mut self, live: bool, logs: bool) -> Result<(), SimError> {
-        // Command line interface for real-time simulation
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(100);
-
+        println!("Starting simulation");
         if live {
             self.spawn_cli(cmd_tx.clone());
         }
@@ -268,11 +270,8 @@ impl World {
                     }
                 }
                 if *self.pause_rx.borrow() {
-                    // Wait for either a state change or new commands
                     tokio::select! {
-                        // Pause state changed (e.g., resumed)
                         _ = self.pause_rx.changed() => {},
-                        // New command received (e.g., "resume")
                         cmd = cmd_rx.recv() => {
                             if let Some(cmd) = cmd {
                                 match cmd {
@@ -287,7 +286,6 @@ impl World {
                             }
                         }
                     }
-                    // Re-check the loop after handling
                     continue;
                 }
             }
@@ -415,10 +413,10 @@ impl World {
                         _ => continue,
                     };
                     if cmd_tx.send(cmd).await.is_err() {
-                        break; // Exit if the channel is closed
+                        break;
                     }
                 } else {
-                    break; // Exit on read error
+                    break;
                 }
             }
         });
@@ -467,9 +465,8 @@ impl World {
         self.pause_rx.borrow().clone()
     }
 
-    pub async fn schedule(
-        &self,
-        sender: Sender<Event>,
+    pub fn schedule(
+        &mut self,
         time: f64,
         agent: usize,
     ) -> Result<(), SimError> {
@@ -478,10 +475,7 @@ impl World {
         } else if time > self.time.terminal.unwrap_or(f64::INFINITY) {
             return Err(SimError::PastTerminal);
         }
-        let result = sender.send(Event::new(time, agent, Action::Wait)).await;
-        if result.is_err() {
-            return Err(SimError::ScheduleFailed);
-        }
+        self.commit(Event::new(time, agent, Action::Wait));
         Ok(())
     }
 
@@ -502,7 +496,10 @@ pub struct Clock {
 }
 
 impl Clock {
-    pub fn new(slots: usize, height: usize) -> Self {
+    pub fn new(slots: usize, height: usize) -> Result<Self, SimError> {
+        if height < 1 {
+            return Err(SimError::NoClock);
+        }
         let mut wheels = Vec::new();
         for _ in 0..height {
             let mut wheel = VecDeque::new();
@@ -511,7 +508,7 @@ impl Clock {
             }
             wheels.push(wheel);
         }
-        Clock {
+        Ok(Clock {
             wheels,
             slots,
             height,
@@ -523,18 +520,18 @@ impl Clock {
                 timescale: 1.0,
                 terminal: None,
             },
-        }
+        })
     }
 
     pub fn insert(&mut self, event: Event) -> Result<(), Event> {
         let time = event.time;
         let delta = time - self.time.time;
         for k in 0..self.height {
-            if delta < (self.slots as f64).powf(1.0 + k as f64) * self.time.timestep {
-                let idx = (time / ((self.slots as f64).powf(1.0 + k as f64) * self.time.timestep))
-                    as usize
-                    % self.slots;
-                self.wheels[k][idx].push(event);
+            let startidx = ((self.slots).pow(1 + k as u32) - self.slots) / (self.slots - 1);
+            let futurestep = (delta / self.time.timestep) as usize;
+            if futurestep > startidx {
+                let offset = (futurestep - startidx) / self.slots.pow(k as u32);
+                self.wheels[k][offset].push(event);
                 return Ok(());
             }
         }
@@ -545,8 +542,7 @@ impl Clock {
         &mut self,
         overflow: &mut BTreeSet<Reverse<Event>>,
     ) -> Result<Vec<Event>, SimError> {
-        let slot0 = ((self.time.time / self.time.timestep) as u64 % self.slots as u64) as usize;
-        let events: Vec<Event> = self.wheels[0][slot0].drain(..).collect();
+        let events: Vec<Event> = self.wheels[0].pop_front().unwrap();
         if self.time.time + self.time.timestep < self.time.terminal.unwrap_or(f64::INFINITY) {
             self.time.time += self.time.timestep;
             self.time.step += 1;
@@ -555,11 +551,20 @@ impl Clock {
                 self.rotate(overflow);
             }
         }
+        if events.is_empty() {
+            return Err(SimError::NoEvents);
+        }
         Ok(events)
     }
 
     fn rotate(&mut self, overflow: &mut BTreeSet<Reverse<Event>>) {
-        for k in 0..(self.height - 1) {
+        if self.height == 1 {
+            for _ in 0..self.slots {
+                overflow.pop_first().map(|event| self.insert(event.0));
+            }
+            return;
+        }
+        for k in 1..(self.height - 1) {
             if self.time.time / self.time.timestep % (self.slots as f64).powf(k as f64) == 0.0 {
                 let events = self.wheels[k].pop_front().unwrap();
                 events.into_iter().all(|event| self.insert(event) == Ok(()));
