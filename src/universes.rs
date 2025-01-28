@@ -21,11 +21,12 @@ impl Universe {
         &mut self,
         live: bool,
         logs: bool,
+        mail: bool,
     ) -> Result<Vec<Result<(), SimError>>> {
         let mut handles = vec![];
         let worlds = std::mem::take(&mut self.worlds);
         for mut world in worlds {
-            let handle = tokio::spawn(async move { world.run(live, logs).await });
+            let handle = tokio::spawn(async move { world.run(live, logs, mail).await });
             handles.push(handle);
         }
         let results = futures::future::join_all(handles).await;
