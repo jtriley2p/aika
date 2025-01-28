@@ -44,7 +44,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_offline_run() {
-        println!("Running test_offline_run");
         let mut world = World::create(1.0, Some(2000000.0), 100, 100);
         let agent_test = TestAgent::new(0, "Test".to_string());
         world.spawn(Box::new(agent_test));

@@ -252,7 +252,6 @@ impl World {
 
     pub async fn run(&mut self, live: bool, logs: bool) -> Result<(), SimError> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(100);
-        println!("Starting simulation");
         if live {
             self.spawn_cli(cmd_tx.clone());
         }
@@ -292,84 +291,92 @@ impl World {
             while let Ok(event) = self.runtime.try_recv() {
                 self.commit(event);
             }
-            if let Ok(event) = self.clock.tick(&mut self.overflow) {
-                for event in event {
-                    if live {
-                        tokio::time::sleep(Duration::from_millis(
-                            (self.time.timestep * 1000.0 / self.time.timescale) as u64,
-                        ))
-                        .await;
-                    }
-                    if event.time > self.time.terminal.unwrap_or(f64::INFINITY) {
-                        break;
-                    }
-                    if event.time < self.time.time {
-                        return Err(SimError::TimeTravel);
-                    }
-                    self.mailbox.collect_messages().await;
-                    let agent = &mut self.agents[event.agent];
-                    let event = agent
-                        .step(&mut self.state, &event.time, &mut self.mailbox)
-                        .await;
-                    if logs {
-                        let agent_states: BTreeMap<
-                            usize,
-                            Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>,
-                        > = self
-                            .agents
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, agt)| {
-                                agt.as_any()
-                                    .downcast_ref::<Box<dyn Loggable>>()
-                                    .map(|loggable| (i, loggable.get_state()))
-                            })
-                            .collect();
-                        self.logger.log(
-                            self.now(),
-                            self.state.clone(),
-                            agent_states,
-                            event.clone(),
-                        );
-                    }
-                    match event.yield_ {
-                        Action::Timeout(time) => {
-                            let new = Event::new(self.time.time + time, event.agent, Action::Wait);
-                            self.commit(new);
+            match self.clock.tick(&mut self.overflow) {
+                Ok(events) => {
+                    println!("Processing events {:?}", self.clock.time.time);
+                    for event in events {
+                        if live {
+                            tokio::time::sleep(Duration::from_millis(
+                                (self.time.timestep * 1000.0 / self.time.timescale) as u64,
+                            ))
+                            .await;
                         }
-                        Action::Schedule(time) => {
-                            let new = Event::new(time, event.agent, Action::Wait);
-                            self.commit(new);
-                        }
-                        Action::Trigger { time, idx } => {
-                            let new = Event::new(time, idx, Action::Wait);
-                            self.commit(new);
-                        }
-                        Action::Wait => {}
-                        Action::Break => {
+                        if event.time > self.time.terminal.unwrap_or(f64::INFINITY) {
                             break;
                         }
-                    }
-                    if live {
-                        while let Ok(cmd) = cmd_rx.try_recv() {
-                            match cmd {
-                                ControlCommand::Pause => self.pause()?,
-                                ControlCommand::Resume => self.resume()?,
-                                ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
-                                ControlCommand::Quit => break,
-                                ControlCommand::Schedule(time, idx) => {
-                                    self.commit(Event::new(time, idx, Action::Wait));
+                        if event.time < self.time.time {
+                            return Err(SimError::TimeTravel);
+                        }
+                        self.mailbox.collect_messages().await;
+                        let agent = &mut self.agents[event.agent];
+                        let event = agent
+                            .step(&mut self.state, &event.time, &mut self.mailbox)
+                            .await;
+                        if logs {
+                            let agent_states: BTreeMap<
+                                usize,
+                                Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>,
+                            > = self
+                                .agents
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, agt)| {
+                                    agt.as_any()
+                                        .downcast_ref::<Box<dyn Loggable>>()
+                                        .map(|loggable| (i, loggable.get_state()))
+                                })
+                                .collect();
+                            self.logger.log(
+                                self.now(),
+                                self.state.clone(),
+                                agent_states,
+                                event.clone(),
+                            );
+                        }
+                        match event.yield_ {
+                            Action::Timeout(time) => {
+                                let new = Event::new(self.time.time + time, event.agent, Action::Wait);
+                                self.commit(new);
+                            }
+                            Action::Schedule(time) => {
+                                let new = Event::new(time, event.agent, Action::Wait);
+                                self.commit(new);
+                            }
+                            Action::Trigger { time, idx } => {
+                                let new = Event::new(time, idx, Action::Wait);
+                                self.commit(new);
+                            }
+                            Action::Wait => {}
+                            Action::Break => {
+                                break;
+                            }
+                        }
+                        if live {
+                            while let Ok(cmd) = cmd_rx.try_recv() {
+                                match cmd {
+                                    ControlCommand::Pause => self.pause()?,
+                                    ControlCommand::Resume => self.resume()?,
+                                    ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                                    ControlCommand::Quit => break,
+                                    ControlCommand::Schedule(time, idx) => {
+                                        self.commit(Event::new(time, idx, Action::Wait));
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            } else {
-                if let Some(event) = self.runtime.recv().await {
-                    self.commit(event);
-                } else {
-                    break;
-                }
+                Err(SimError::NoEvents) => {
+                    println!("Processing events 2 ");
+                    if let Some(event) = self.runtime.recv().await {
+                        self.commit(event);
+                    } else {
+                        break;
+                    }
+                } 
+                Err(_) => {
+                    println!("Processing events 3 ");
+                },
             }
         }
         Ok(())
@@ -497,6 +504,7 @@ pub struct Clock {
 
 impl Clock {
     pub fn new(slots: usize, height: usize) -> Result<Self, SimError> {
+        println!("Creating clock");
         if height < 1 {
             return Err(SimError::NoClock);
         }
@@ -529,7 +537,10 @@ impl Clock {
         for k in 0..self.height {
             let startidx = ((self.slots).pow(1 + k as u32) - self.slots) / (self.slots - 1);
             let futurestep = (delta / self.time.timestep) as usize;
-            if futurestep > startidx {
+            if futurestep >= startidx {
+                if futurestep >= ((self.slots).pow(1 + self.height as u32) - self.slots) / (self.slots - 1) {
+                    return Err(event);
+                }
                 let offset = (futurestep - startidx) / self.slots.pow(k as u32);
                 self.wheels[k][offset].push(event);
                 return Ok(());
@@ -542,7 +553,10 @@ impl Clock {
         &mut self,
         overflow: &mut BTreeSet<Reverse<Event>>,
     ) -> Result<Vec<Event>, SimError> {
-        let events: Vec<Event> = self.wheels[0].pop_front().unwrap();
+        let mut events: Vec<Event> = self.wheels[0].pop_front().unwrap();
+        if events.is_empty() {
+            return Err(SimError::NoEvents);
+        }
         if self.time.time + self.time.timestep < self.time.terminal.unwrap_or(f64::INFINITY) {
             self.time.time += self.time.timestep;
             self.time.step += 1;
@@ -550,9 +564,6 @@ impl Clock {
                 self.epoch += 1;
                 self.rotate(overflow);
             }
-        }
-        if events.is_empty() {
-            return Err(SimError::NoEvents);
         }
         Ok(events)
     }
