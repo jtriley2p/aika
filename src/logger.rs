@@ -3,11 +3,12 @@ use std::collections::{BTreeMap, BinaryHeap};
 
 use crate::worlds::{Event, State};
 
+/// A snapshot of the world at a given time.
 #[derive(Clone)]
 pub struct Snapshot {
-    timestamp: f64,
-    shared_state: Option<State>,
-    agent_states: BTreeMap<usize, State>,
+    pub timestamp: f64,
+    pub shared_state: Option<State>,
+    pub agent_states: BTreeMap<usize, State>,
 }
 
 impl PartialEq for Snapshot {
@@ -30,19 +31,21 @@ impl Ord for Snapshot {
     }
 }
 
+/// A logger for recording snapshots of the world.
 pub struct Logger {
     snapshots: BinaryHeap<Snapshot>,
     events: BinaryHeap<Event>,
 }
 
 impl Logger {
+    /// Create a new logger.
     pub fn new() -> Self {
         Logger {
             snapshots: BinaryHeap::new(),
             events: BinaryHeap::new(),
         }
     }
-
+    /// Log a snapshot of the world.
     pub fn log(
         &mut self,
         timestamp: f64,
@@ -57,7 +60,7 @@ impl Logger {
         });
         self.events.push(event);
     }
-
+    /// Get the events logged.
     pub fn get_snapshots(&self) -> BinaryHeap<Snapshot> {
         self.snapshots.clone()
     }

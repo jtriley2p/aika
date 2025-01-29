@@ -35,6 +35,65 @@ impl Agent for TestAgent {
     }
 }
 
+pub struct SingleStepAgent {
+    pub id: usize,
+    pub name: String,
+}
+
+impl SingleStepAgent {
+    pub fn new(id: usize, name: String) -> Self {
+        SingleStepAgent { id, name }
+    }
+}
+
+impl Agent for SingleStepAgent {
+    fn step<'a>(
+        &'a mut self,
+        state: &'a mut Option<State>,
+        time: &f64,
+        mailbox: &'a mut Mailbox,
+    ) -> BoxFuture<'a, Event> {
+        let event = Event::new(*time, self.id, Action::Wait);
+        Box::pin(async { event })
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+pub struct MessengerAgent {
+    pub id: usize,
+    pub name: String,
+}
+
+impl MessengerAgent {
+    pub fn new(id: usize, name: String) -> Self {
+        MessengerAgent { id, name }
+    }
+}
+
+impl Agent for MessengerAgent {
+    fn step<'a>(
+        &'a mut self,
+        state: &'a mut Option<State>,
+        time: &f64,
+        mailbox: &'a mut Mailbox,
+    ) -> BoxFuture<'a, Event> {
+        let mailtome = mailbox
+            .peek_messages()
+            .iter()
+            .filter(|m| m.to == self.id)
+            .collect::<Vec<_>>();
+        let returnmessage = Message::new(Box::new("Hello"), time + 1.0, self.id, 1);
+        mailbox.send(returnmessage);
+        let event = Event::new(*time, self.id, Action::Wait);
+        Box::pin(async { event })
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -43,37 +102,33 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_offline_run() {
-        let mut world = World::create(1.0, Some(2000000.0), 100, 100);
+    async fn test_run() {
+        let config = Config::new(1.0, Some(2000000.0), 100, 100, false, false, false, false);
+        let mut world = World::create(config);
         let agent_test = TestAgent::new(0, "Test".to_string());
         world.spawn(Box::new(agent_test));
         world.schedule(0.0, 0).unwrap();
-        assert!(world.run(false, false, false).await.unwrap() == ());
+        assert!(world.run().await.unwrap() == ());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_bench() {
-        // Benchmark parameters
-        let duration_secs = 2000000;
-        let timestep = 1.0; // 1ms timestep for fine-grained events
+    async fn test_baseline_processing_bench() {
+        let duration_secs = 20000000;
+        let timestep = 1.0;
         let terminal = Some(duration_secs as f64);
 
-        // Create world with smaller buffers for faster processing
-        let mut world = World::create(timestep, terminal, 1000, 1000);
+        // minimal config world, no logs, no mail, no live for base processing speed benchmark
+        let config = Config::new(timestep, terminal, 1000, 1000, false, false, false, false);
+        let mut world = World::create(config);
 
-        // Add multiple agents to generate more events
         let agent = TestAgent::new(0, format!("Test{}", 0));
         world.spawn(Box::new(agent));
-        // Schedule initial events for each agent
         world.schedule(0.0, 0).unwrap();
 
-        // Start timing
         let start = Instant::now();
-
-        // Run simulation without live mode or logging for maximum performance
-        world.run(false, false, false).await.unwrap();
-
+        world.run().await.unwrap();
         let elapsed = start.elapsed();
+
         let total_steps = world.step_counter();
 
         println!("Benchmark Results:");
@@ -88,4 +143,43 @@ mod tests {
             elapsed / total_steps as u32
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_periphery() {
+        let config = Config::new(1.0, Some(1000.0), 100, 100, false, true, false, false);
+        let mut world = World::create(config);
+        let agent_test = SingleStepAgent::new(0, "Test".to_string());
+        world.spawn(Box::new(agent_test));
+        world.schedule(0.0, 0).unwrap();
+
+        assert!(world.step_counter() == 0);
+        assert!(world.now() == 0.0);
+        assert!(world.state().is_none());
+
+        world.run().await.unwrap();
+
+        assert!(world
+            .logger
+            .get_snapshots()
+            .pop()
+            .unwrap()
+            .shared_state
+            .is_none());
+        assert!(
+            world
+                .logger
+                .get_snapshots()
+                .pop()
+                .unwrap()
+                .agent_states
+                .len()
+                == 0
+        );
+        assert!(world.logger.get_snapshots().pop().unwrap().timestamp == 1.0);
+
+        assert!(world.now() == 1000.0);
+        assert!(world.step_counter() == 1000);
+    }
+
+    // need to fix and test the mailbox, and write some universe tests
 }
