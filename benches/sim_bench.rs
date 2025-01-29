@@ -1,6 +1,9 @@
-use std::hint::black_box;
-use aika::{worlds::{Config, World}, TestAgent};
+use aika::{
+    worlds::{Config, World},
+    TestAgent,
+};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
 use tokio::runtime::Runtime;
 
 async fn run_sim(id: usize, config: Config) {
@@ -23,7 +26,8 @@ fn sim_bench(c: &mut Criterion) {
     let id: usize = 0;
 
     c.bench_with_input(BenchmarkId::new("run_sim", id), &id, |b, &i| {
-        b.to_async(Runtime::new().unwrap()).iter(|| run_sim(black_box(i), black_box(config.clone())));
+        b.to_async(Runtime::new().unwrap())
+            .iter(|| run_sim(black_box(i), black_box(config.clone())));
     });
 }
 
