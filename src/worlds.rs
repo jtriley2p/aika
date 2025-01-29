@@ -52,7 +52,7 @@ impl Ord for Message {
     }
 }
 
-/// A mailbox for agents to send and receive messages.
+/// A mailbox for agents to send and receive messages. WIP
 pub struct Mailbox {
     tx: Sender<Message>,
     rx: Receiver<Message>,
@@ -370,28 +370,28 @@ impl World {
     }
 
     /// Block the long term actions of agents !!this is broken since the shift to the timing wheel!!
-    pub fn block_agent(&mut self, idx: usize, until: Option<f64>) -> Result<(), SimError> {
-        if self.agents.len() <= idx {
-            return Err(SimError::InvalidIndex);
-        }
-        if until.is_none() {
-            self.overflow.retain(|x| x.0.agent != idx);
-        }
-        self.overflow
-            .retain(|x| x.0.agent != idx && x.0.time < until.unwrap());
-        Ok(())
-    }
-    /// remove a particular pending event !!this is broken since the shift to the timing wheel!!
-    pub fn remove_event(&mut self, idx: usize, time: f64) -> Result<(), SimError> {
-        if self.agents.len() <= idx {
-            return Err(SimError::InvalidIndex);
-        } else if self.clock.time.time > time {
-            return Err(SimError::TimeTravel);
-        }
-        self.overflow
-            .retain(|x| x.0.agent != idx && x.0.time != time);
-        Ok(())
-    }
+    // pub fn block_agent(&mut self, idx: usize, until: Option<f64>) -> Result<(), SimError> {
+    //     if self.agents.len() <= idx {
+    //         return Err(SimError::InvalidIndex);
+    //     }
+    //     if until.is_none() {
+    //         self.overflow.retain(|x| x.0.agent != idx);
+    //     }
+    //     self.overflow
+    //         .retain(|x| x.0.agent != idx && x.0.time < until.unwrap());
+    //     Ok(())
+    // }
+    // /// remove a particular pending event !!this is broken since the shift to the timing wheel!!
+    // pub fn remove_event(&mut self, idx: usize, time: f64) -> Result<(), SimError> {
+    //     if self.agents.len() <= idx {
+    //         return Err(SimError::InvalidIndex);
+    //     } else if self.clock.time.time > time {
+    //         return Err(SimError::TimeTravel);
+    //     }
+    //     self.overflow
+    //         .retain(|x| x.0.agent != idx && x.0.time != time);
+    //     Ok(())
+    // }
 
     /// Schedule an event for an agent at a given time.
     pub fn schedule(&mut self, time: f64, agent: usize) -> Result<(), SimError> {
