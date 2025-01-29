@@ -22,5 +22,5 @@ serde = "1.0.217"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [[bench]]
-name = "realtime"
+name = "sim_bench"
 harness = false
