@@ -17,3 +17,10 @@ futures = "0.3.31"
 anyhow = "1.0.95"
 rayon = "1.10.0"
 serde = "1.0.217"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "sim_bench"
+harness = false

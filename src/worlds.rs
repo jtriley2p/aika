@@ -216,6 +216,7 @@ unsafe impl Send for World {}
 unsafe impl Sync for World {}
 
 /// Configuration for the world
+#[derive(Clone)]
 pub struct Config {
     pub timestep: f64,
     pub terminal: Option<f64>,
