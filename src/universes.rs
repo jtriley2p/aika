@@ -4,28 +4,31 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::worlds::*;
 
+/// A universe is a collection of worlds that can be run in parallel.
 pub struct Universe {
     pub worlds: Vec<World>,
 }
 
 impl Universe {
+    /// Create a new universe.
     pub fn new() -> Self {
         Universe { worlds: Vec::new() }
     }
-
+    /// Add a world to the universe.
     pub fn add_world(&mut self, world: World) {
         self.worlds.push(world);
     }
-
+    /// Run all worlds in the universe in parallel.
     pub async fn run_parallel(
         &mut self,
         live: bool,
         logs: bool,
+        mail: bool,
     ) -> Result<Vec<Result<(), SimError>>> {
         let mut handles = vec![];
         let worlds = std::mem::take(&mut self.worlds);
         for mut world in worlds {
-            let handle = tokio::spawn(async move { world.run(live, logs).await });
+            let handle = tokio::spawn(async move { world.run().await });
             handles.push(handle);
         }
         let results = futures::future::join_all(handles).await;
@@ -40,7 +43,7 @@ impl Universe {
 
         Ok(results)
     }
-
+    /// pause all worlds in the universe
     pub fn pause_all(&mut self) -> Result<(), Vec<SimError>> {
         let errors: Vec<_> = self
             .worlds
@@ -53,7 +56,7 @@ impl Universe {
             Err(errors)
         }
     }
-
+    /// resume all worlds in the universe
     pub fn resume_all(&mut self) -> Result<(), Vec<SimError>> {
         let errors: Vec<_> = self
             .worlds

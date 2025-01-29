@@ -1,10 +1,11 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::any::Any;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc::{channel, error, Receiver, Sender};
@@ -12,11 +13,23 @@ use tokio::sync::watch;
 
 use crate::logger::Logger;
 
+/// A message that can be sent between agents.
 pub struct Message {
     pub data: Box<dyn Any + Send + Sync>,
     pub timestamp: f64,
     pub from: usize,
     pub to: usize,
+}
+
+impl Message {
+    pub fn new(data: Box<dyn Any + Send + Sync>, timestamp: f64, from: usize, to: usize) -> Self {
+        Message {
+            data,
+            timestamp,
+            from,
+            to,
+        }
+    }
 }
 
 impl PartialEq for Message {
@@ -39,6 +52,7 @@ impl Ord for Message {
     }
 }
 
+/// A mailbox for agents to send and receive messages.
 pub struct Mailbox {
     tx: Sender<Message>,
     rx: Receiver<Message>,
@@ -86,6 +100,7 @@ impl Mailbox {
     }
 }
 
+/// An agent that can be run in a simulation.
 pub trait Agent: Send {
     fn step<'a>(
         &'a mut self,
@@ -100,9 +115,10 @@ pub trait Loggable: Agent {
     fn get_state(&self) -> State;
 }
 
-// Thread-safe loggable generic state type
+/// Thread-safe loggable generic state type
 pub type State = Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>;
 
+/// A scheduling action that an agent can take.
 #[derive(Clone, Debug)]
 pub enum Action {
     Timeout(f64),
@@ -112,6 +128,7 @@ pub enum Action {
     Break,
 }
 
+/// An event that can be scheduled in a simulation. This is used to trigger an agent, or schedule another event.
 #[derive(Clone, Debug)]
 pub struct Event {
     time: f64,
@@ -147,6 +164,7 @@ impl Ord for Event {
     }
 }
 
+/// The relevant time information for the simulation.
 struct Time {
     time: f64,
     step: usize,
@@ -155,17 +173,21 @@ struct Time {
     terminal: Option<f64>,
 }
 
+/// Error enum for provide feedback on simulation errors
 #[derive(Debug, Clone)]
 pub enum SimError {
     TimeTravel,
     PastTerminal,
-    NoState,
     ScheduleFailed,
-    PauseError,
+    PlaybackFroze,
+    NoState,
+    NoEvents,
+    NoClock,
     InvalidIndex,
     TokioError(String),
 }
 
+/// Control commands for the real-time simulation
 pub enum ControlCommand {
     Pause,
     Resume,
@@ -174,15 +196,17 @@ pub enum ControlCommand {
     Schedule(f64, usize),
 }
 
+/// A world that can contain multiple agents and run a simulation.
 pub struct World {
-    pending: BTreeSet<Reverse<Event>>,
+    overflow: BTreeSet<Reverse<Event>>,
+    clock: Clock,
     savedmail: BTreeSet<Message>,
     agents: Vec<Box<dyn Agent>>,
     mailbox: Mailbox,
-    time: Time,
     state: Option<State>,
-    pub sender: Sender<Event>,
+    runtype: (bool, bool, bool, bool),
     runtime: Receiver<Event>,
+    pub sender: Sender<Event>,
     pub pause_tx: watch::Sender<bool>,
     pub pause_rx: watch::Receiver<bool>,
     pub logger: Logger,
@@ -191,29 +215,56 @@ pub struct World {
 unsafe impl Send for World {}
 unsafe impl Sync for World {}
 
-impl World {
-    pub fn create(
+/// Configuration for the world
+pub struct Config {
+    pub timestep: f64,
+    pub terminal: Option<f64>,
+    pub buffer_size: usize,
+    pub mailbox_size: usize,
+    pub live: bool,
+    pub logs: bool,
+    pub mail: bool,
+    pub asyncronous: bool,
+}
+
+impl Config {
+    pub fn new(
         timestep: f64,
         terminal: Option<f64>,
         buffer_size: usize,
         mailbox_size: usize,
+        live: bool,
+        logs: bool,
+        mail: bool,
+        asyncronous: bool,
     ) -> Self {
-        let (sim_tx, sim_rx) = channel(buffer_size);
-        let time = Time {
-            time: 0.0,
-            step: 0,
+        Config {
             timestep,
-            timescale: 1.0,
             terminal,
-        };
+            buffer_size,
+            mailbox_size,
+            live,
+            logs,
+            mail,
+            asyncronous,
+        }
+    }
+}
+
+impl World {
+    /// Create a new world with the given configuration.
+    /// By default, this will include a toggleable CLI for real-time simulation control, a logger for state logging, an asynchronous runtime, and a mailbox for message passing between agents.
+    pub fn create(config: Config) -> Self {
+        let (sim_tx, sim_rx) = channel(config.buffer_size);
         let (pause_tx, pause_rx) = watch::channel(false);
-        let mailbox = Mailbox::new(mailbox_size, pause_rx.clone());
+        let mailbox = Mailbox::new(config.mailbox_size, pause_rx.clone());
         World {
-            pending: BTreeSet::new(),
+            overflow: BTreeSet::new(),
+            clock: Clock::new(256, 1, config.timestep, config.terminal).unwrap(),
             savedmail: BTreeSet::new(),
             agents: Vec::new(),
             mailbox,
-            time,
+            runtype: (config.live, config.logs, config.mail, config.asyncronous),
             state: None,
             sender: sim_tx,
             runtime: sim_rx,
@@ -222,81 +273,150 @@ impl World {
             logger: Logger::new(),
         }
     }
-
+    /// Spawn a new agent into the world.
     pub fn spawn(&mut self, agent: Box<dyn Agent>) -> usize {
         self.agents.push(agent);
         self.agents.len() - 1
     }
 
+    fn spawn_cli(&self, cmd_tx: Sender<ControlCommand>) {
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.is_ok() {
+                    let cmd = match line.trim() {
+                        "pause" => ControlCommand::Pause,
+                        "resume" => ControlCommand::Resume,
+                        "quit" => ControlCommand::Quit,
+                        cmd if cmd.starts_with("speed ") => {
+                            if let Some(scale) = cmd
+                                .split_whitespace()
+                                .nth(1)
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                ControlCommand::SetTimeScale(scale)
+                            } else {
+                                continue;
+                            }
+                        }
+                        cmd if cmd.starts_with("schedule ") => {
+                            let parts: Vec<_> = cmd.split_whitespace().collect();
+                            if parts.len() >= 3 {
+                                if let (Some(time), Some(idx)) =
+                                    (parts[1].parse::<f64>().ok(), parts[2].parse::<usize>().ok())
+                                {
+                                    ControlCommand::Schedule(time, idx)
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue,
+                    };
+                    if cmd_tx.send(cmd).await.is_err() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn log_mail(&mut self, msg: Message) {
+        self.savedmail.insert(msg);
+    }
+
+    fn commit(&mut self, event: Event) {
+        let event_maybe = self.clock.insert(event);
+        if event_maybe.is_err() {
+            self.overflow.insert(Reverse(event_maybe.err().unwrap()));
+        }
+    }
+    /// Pause the real-time simulation.
     pub fn pause(&self) -> Result<(), SimError> {
         let pause = self.pause_tx.send(true);
         if pause.is_err() {
-            return Err(SimError::PauseError);
+            return Err(SimError::PlaybackFroze);
         }
         Ok(())
     }
-
+    /// Resume the real-time simulation.
     pub fn resume(&self) -> Result<(), SimError> {
         let resume = self.pause_tx.send(false);
         if resume.is_err() {
-            return Err(SimError::PauseError);
+            return Err(SimError::PlaybackFroze);
         }
         Ok(())
     }
+    /// speed up/slow down the simulation playback.
+    pub fn rescale_time(&mut self, timescale: f64) {
+        self.clock.time.timescale = timescale;
+    }
+    /// Get the current time of the simulation.
+    pub fn now(&self) -> f64 {
+        self.clock.time.time
+    }
+    /// Get the current step of the simulation.
+    pub fn step_counter(&self) -> usize {
+        self.clock.time.step
+    }
+    /// Clone the current state of the simulation.
+    pub fn state(&self) -> Option<State> {
+        self.state.clone()
+    }
 
-    pub async fn run(&mut self, live: bool, logs: bool) -> Result<(), SimError> {
-        // Command line interface for real-time simulation
+    /// Block the long term actions of agents !!this is broken since the shift to the timing wheel!!
+    pub fn block_agent(&mut self, idx: usize, until: Option<f64>) -> Result<(), SimError> {
+        if self.agents.len() <= idx {
+            return Err(SimError::InvalidIndex);
+        }
+        if until.is_none() {
+            self.overflow.retain(|x| x.0.agent != idx);
+        }
+        self.overflow
+            .retain(|x| x.0.agent != idx && x.0.time < until.unwrap());
+        Ok(())
+    }
+    /// remove a particular pending event !!this is broken since the shift to the timing wheel!!
+    pub fn remove_event(&mut self, idx: usize, time: f64) -> Result<(), SimError> {
+        if self.agents.len() <= idx {
+            return Err(SimError::InvalidIndex);
+        } else if self.clock.time.time > time {
+            return Err(SimError::TimeTravel);
+        }
+        self.overflow
+            .retain(|x| x.0.agent != idx && x.0.time != time);
+        Ok(())
+    }
+
+    /// Schedule an event for an agent at a given time.
+    pub fn schedule(&mut self, time: f64, agent: usize) -> Result<(), SimError> {
+        if time < self.clock.time.time {
+            return Err(SimError::TimeTravel);
+        } else if time > self.clock.time.terminal.unwrap_or(f64::INFINITY) {
+            return Err(SimError::PastTerminal);
+        }
+        self.commit(Event::new(time, agent, Action::Wait));
+        Ok(())
+    }
+
+    /// Run the simulation.
+    pub async fn run(&mut self) -> Result<(), SimError> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(100);
-
-        if live {
-            // Spawn a single continuous CLI task
-            let cmd_tx_clone = cmd_tx.clone();
-            tokio::spawn(async move {
-                let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).await.is_ok() {
-                        let cmd = match line.trim() {
-                            "pause" => ControlCommand::Pause,
-                            "resume" => ControlCommand::Resume,
-                            "quit" => ControlCommand::Quit,
-                            cmd if cmd.starts_with("speed ") => {
-                                if let Some(scale) = cmd.split_whitespace().nth(1)
-                                    .and_then(|s| s.parse::<f64>().ok()) 
-                                {
-                                    ControlCommand::SetTimeScale(scale)
-                                } else {
-                                    continue;
-                                }
-                            }
-                            cmd if cmd.starts_with("schedule ") => {
-                                let parts: Vec<_> = cmd.split_whitespace().collect();
-                                if parts.len() >= 3 {
-                                    if let (Some(time), Some(idx)) = (
-                                        parts[1].parse::<f64>().ok(),
-                                        parts[2].parse::<usize>().ok(),
-                                    ) {
-                                        ControlCommand::Schedule(time, idx)
-                                    } else {
-                                        continue;
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            }
-                            _ => continue,
-                        };
-                        if cmd_tx_clone.send(cmd).await.is_err() {
-                            break; // Exit if the channel is closed
-                        }
-                    } else {
-                        break; // Exit on read error
-                    }
-                }
-            });
+        if self.runtype.0 {
+            self.spawn_cli(cmd_tx.clone());
         }
         loop {
-            if live {
+            if self.clock.time.time + self.clock.time.timestep
+                > self.clock.time.terminal.unwrap_or(f64::INFINITY)
+            {
+                break;
+            }
+            if self.runtype.0 {
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         ControlCommand::Pause => self.pause()?,
@@ -304,17 +424,13 @@ impl World {
                         ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
                         ControlCommand::Quit => break,
                         ControlCommand::Schedule(time, idx) => {
-                            self.pending
-                                .insert(Reverse(Event::new(time, idx, Action::Wait)));
+                            self.commit(Event::new(time, idx, Action::Wait));
                         }
                     }
                 }
                 if *self.pause_rx.borrow() {
-                    // Wait for either a state change or new commands
                     tokio::select! {
-                        // Pause state changed (e.g., resumed)
                         _ = self.pause_rx.changed() => {},
-                        // New command received (e.g., "resume")
                         cmd = cmd_rx.recv() => {
                             if let Some(cmd) = cmd {
                                 match cmd {
@@ -323,158 +439,226 @@ impl World {
                                     ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
                                     ControlCommand::Quit => break,
                                     ControlCommand::Schedule(time, idx) => {
-                                        self.pending.insert(Reverse(Event::new(time, idx, Action::Wait)));
+                                        self.commit(Event::new(time, idx, Action::Wait));
                                     }
                                 }
                             }
                         }
                     }
-                    // Re-check the loop after handling
                     continue;
                 }
             }
-            while let Ok(event) = self.runtime.try_recv() {
-                self.pending.insert(Reverse(event));
+            if self.runtype.3 {
+                while let Ok(event) = self.runtime.try_recv() {
+                    self.commit(event);
+                }
             }
-            if let Some(event) = self.pending.pop_first() {
-                if live {
-                    tokio::time::sleep(Duration::from_millis(
-                        (self.time.timestep * 1000.0 / self.time.timescale) as u64,
-                    ))
-                    .await;
-                }
-                let event = event.0;
-                if event.time > self.time.terminal.unwrap_or(f64::INFINITY) {
-                    break;
-                }
-                if event.time < self.time.time {
-                    return Err(SimError::TimeTravel);
-                }
-                self.mailbox.collect_messages().await;
-                self.time.time = event.time;
-                self.time.step += 1;
-                let agent = &mut self.agents[event.agent];
-                let event = agent
-                    .step(&mut self.state, &event.time, &mut self.mailbox)
-                    .await;
-                if logs {
-                    let agent_states: BTreeMap<usize, Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>> =
-                        self.agents
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, agt)| {
-                                agt.as_any()
-                                    .downcast_ref::<Box<dyn Loggable>>()
-                                    .map(|loggable| (i, loggable.get_state()))
-                            })
-                            .collect();
-                    self.logger
-                        .log(self.now(), self.state.clone(), agent_states, event.clone());
-                }
-                match event.yield_ {
-                    Action::Timeout(time) => {
-                        self.pending.insert(Reverse(Event::new(
-                            self.time.time + time,
-                            event.agent,
-                            Action::Wait,
-                        )));
-                    }
-                    Action::Schedule(time) => {
-                        self.pending
-                            .insert(Reverse(Event::new(time, event.agent, Action::Wait)));
-                    }
-                    Action::Trigger { time, idx } => {
-                        self.pending
-                            .insert(Reverse(Event::new(time, idx, Action::Wait)));
-                    }
-                    Action::Wait => {}
-                    Action::Break => {
-                        break;
-                    }
-                }
-                if live {
-                    while let Ok(cmd) = cmd_rx.try_recv() {
-                        match cmd {
-                            ControlCommand::Pause => self.pause()?,
-                            ControlCommand::Resume => self.resume()?,
-                            ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
-                            ControlCommand::Quit => break,
-                            ControlCommand::Schedule(time, idx) => {
-                                self.pending
-                                    .insert(Reverse(Event::new(time, idx, Action::Wait)));
+            match self.clock.tick(&mut self.overflow) {
+                Ok(events) => {
+                    // if self.clock.time.step % 10000 == 0 {
+                    //     println!("Processing events {:?}", self.clock.time.time);
+                    // }
+                    for event in events {
+                        if self.runtype.0 {
+                            tokio::time::sleep(Duration::from_millis(
+                                (self.clock.time.timestep * 1000.0 / self.clock.time.timescale)
+                                    as u64,
+                            ))
+                            .await;
+                        }
+                        if event.time > self.clock.time.terminal.unwrap_or(f64::INFINITY) {
+                            break;
+                        }
+                        if self.runtype.2 {
+                            self.mailbox.collect_messages().await;
+                        }
+                        let agent = &mut self.agents[event.agent];
+                        let event = agent
+                            .step(&mut self.state, &event.time, &mut self.mailbox)
+                            .await;
+                        if self.runtype.1 {
+                            let agent_states: BTreeMap<
+                                usize,
+                                Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>,
+                            > = self
+                                .agents
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, agt)| {
+                                    agt.as_any()
+                                        .downcast_ref::<Box<dyn Loggable>>()
+                                        .map(|loggable| (i, loggable.get_state()))
+                                })
+                                .collect();
+                            self.logger.log(
+                                self.now(),
+                                self.state.clone(),
+                                agent_states,
+                                event.clone(),
+                            );
+                        }
+                        match event.yield_ {
+                            Action::Timeout(time) => {
+                                if self.clock.time.time + time
+                                    > self.clock.time.terminal.unwrap_or(f64::INFINITY)
+                                {
+                                    continue;
+                                }
+                                let new = Event::new(
+                                    self.clock.time.time + time,
+                                    event.agent,
+                                    Action::Wait,
+                                );
+                                self.commit(new);
+                            }
+                            Action::Schedule(time) => {
+                                let new = Event::new(time, event.agent, Action::Wait);
+                                self.commit(new);
+                            }
+                            Action::Trigger { time, idx } => {
+                                let new = Event::new(time, idx, Action::Wait);
+                                self.commit(new);
+                            }
+                            Action::Wait => {}
+                            Action::Break => {
+                                break;
+                            }
+                        }
+                        if self.runtype.0 {
+                            while let Ok(cmd) = cmd_rx.try_recv() {
+                                match cmd {
+                                    ControlCommand::Pause => self.pause()?,
+                                    ControlCommand::Resume => self.resume()?,
+                                    ControlCommand::SetTimeScale(scale) => self.rescale_time(scale),
+                                    ControlCommand::Quit => break,
+                                    ControlCommand::Schedule(time, idx) => {
+                                        self.commit(Event::new(time, idx, Action::Wait));
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            } else {
-                if let Some(event) = self.runtime.recv().await {
-                    self.pending.insert(Reverse(event));
-                } else {
-                    break;
+                Err(SimError::NoEvents) => {
+                    if self.runtype.3 {
+                        if let Some(event) = self.runtime.recv().await {
+                            self.commit(event);
+                            continue;
+                        }
+                    }
+                    continue;
                 }
+                Err(_) => {}
             }
         }
         Ok(())
     }
+}
 
-    pub fn now(&self) -> f64 {
-        self.time.time
-    }
+/// A hierarchical timing wheel for scheduling events in a simulation.
+struct Clock {
+    wheels: Vec<VecDeque<Vec<Event>>>,
+    slots: usize,
+    height: usize,
+    epoch: usize,
+    time: Time,
+}
 
-    pub fn step_counter(&self) -> usize {
-        self.time.step
-    }
-
-    pub fn block_agent(&mut self, idx: usize, until: Option<f64>) -> Result<(), SimError> {
-        if self.agents.len() <= idx {
-            return Err(SimError::InvalidIndex);
+impl Clock {
+    fn new(
+        slots: usize,
+        height: usize,
+        timestep: f64,
+        terminal: Option<f64>,
+    ) -> Result<Self, SimError> {
+        if height < 1 {
+            return Err(SimError::NoClock);
         }
-        if until.is_none() {
-            self.pending.retain(|x| x.0.agent != idx);
+        let mut wheels = Vec::new();
+        for _ in 0..height {
+            let mut wheel = VecDeque::new();
+            for _ in 0..slots {
+                wheel.push_back(Vec::new());
+            }
+            wheels.push(wheel);
         }
-        self.pending
-            .retain(|x| x.0.agent != idx && x.0.time < until.unwrap());
-        Ok(())
+        Ok(Clock {
+            wheels,
+            slots,
+            height,
+            epoch: 0,
+            time: Time {
+                time: 0.0,
+                step: 0,
+                timestep: timestep,
+                timescale: 1.0,
+                terminal: terminal,
+            },
+        })
     }
 
-    pub fn remove_event(&mut self, idx: usize, time: f64) -> Result<(), SimError> {
-        if self.agents.len() <= idx {
-            return Err(SimError::InvalidIndex);
-        } else if self.time.time > time {
+    /// Insert an event into the timing wheel.
+    /// checks how many timesteps into the future the event is and selects the appropriate wheel before finding a slot. If too far into the future, the event is returned.
+    fn insert(&mut self, event: Event) -> Result<(), Event> {
+        let time = event.time;
+        let delta = time - self.time.time - self.time.timestep;
+
+        for k in 0..self.height {
+            let startidx = ((self.slots).pow(1 + k as u32) - self.slots) / (self.slots - 1);
+            let futurestep = (delta / self.time.timestep) as usize;
+            if futurestep >= startidx {
+                if futurestep
+                    >= ((self.slots).pow(1 + self.height as u32) - self.slots) / (self.slots - 1)
+                {
+                    return Err(event);
+                }
+                let offset = (futurestep - startidx) / self.slots.pow(k as u32);
+                self.wheels[k][offset].push(event);
+                return Ok(());
+            }
+        }
+        Err(event)
+    }
+
+    /// Pop the next timestep's events from the timing wheel and roll the wheel forward.
+    fn tick(&mut self, overflow: &mut BTreeSet<Reverse<Event>>) -> Result<Vec<Event>, SimError> {
+        let events: Vec<Event> = self.wheels[0].pop_front().unwrap();
+        if !events.is_empty() && events[0].time < self.time.time {
             return Err(SimError::TimeTravel);
         }
-        self.pending
-            .retain(|x| x.0.agent != idx && x.0.time != time);
-        Ok(())
-    }
-
-    pub fn log_mail(&mut self, msg: Message) {
-        self.savedmail.insert(msg);
-    }
-
-    pub fn rescale_time(&mut self, timescale: f64) {
-        self.time.timescale = timescale;
-    }
-
-    pub fn check_status(&self) -> bool {
-        self.pause_rx.borrow().clone()
-    }
-
-    pub async fn schedule(
-        &self,
-        sender: Sender<Event>,
-        time: f64,
-        agent: usize,
-    ) -> Result<(), SimError> {
-        if time < self.time.time {
-            return Err(SimError::TimeTravel);
-        } else if time > self.time.terminal.unwrap_or(f64::INFINITY) {
-            return Err(SimError::PastTerminal);
+        self.wheels[0].push_back(Vec::new());
+        self.time.time += self.time.timestep;
+        self.time.step += 1;
+        if (self.time.time / self.time.timestep) as u64 % self.slots as u64 == 0 {
+            self.epoch += 1;
+            self.rotate(overflow);
         }
-        let result = sender.send(Event::new(time, agent, Action::Wait)).await;
-        if result.is_err() {
-            return Err(SimError::ScheduleFailed);
+        if events.is_empty() {
+            return Err(SimError::NoEvents);
         }
-        Ok(())
+        Ok(events)
+    }
+
+    /// Rotate the timing wheel, moving events from the k-th wheel to fill the (k-1)-th wheel.
+    fn rotate(&mut self, overflow: &mut BTreeSet<Reverse<Event>>) {
+        let current_step = self.time.step as u64 + 1;
+
+        for k in 1..self.height {
+            let wheel_period = self.slots.pow(k as u32);
+            if current_step % (wheel_period as u64) == 0 {
+                if self.height == k {
+                    for _ in 0..self.slots.pow(self.height as u32 - 1) {
+                        overflow.pop_first().map(|event| self.insert(event.0));
+                    }
+                    return;
+                }
+                if let Some(higher_events) = self.wheels[k].pop_front() {
+                    for event in higher_events {
+                        self.insert(event).unwrap();
+                    }
+                    self.wheels[k].push_back(Vec::new());
+                }
+            }
+        }
     }
 }
