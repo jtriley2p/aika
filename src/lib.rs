@@ -1,7 +1,5 @@
-use std::sync::{Arc, Mutex};
-
 use futures::future::BoxFuture;
-use worlds::{Action, Agent, Event, Loggable, Mailbox, Message, State};
+use worlds::{Action, Agent, Event, Mailbox, Message, State};
 
 extern crate tokio;
 
@@ -23,9 +21,9 @@ impl TestAgent {
 impl<T: Send + Sync + Clone> Agent<T> for TestAgent {
     fn step<'a>(
         &'a mut self,
-        state: &'a mut Option<State>,
+        _state: &'a mut Option<State>,
         time: &f64,
-        mailbox: &'a mut Mailbox<T>,
+        _mailbox: &'a mut Mailbox<T>,
     ) -> BoxFuture<'a, Event> {
         let event = Event::new(*time, self.id, Action::Timeout(1.0));
         Box::pin(async { event })
@@ -49,9 +47,9 @@ impl SingleStepAgent {
 impl<T: Send + Sync + Clone> Agent<T> for SingleStepAgent {
     fn step<'a>(
         &'a mut self,
-        state: &'a mut Option<State>,
+        _state: &'a mut Option<State>,
         time: &f64,
-        mailbox: &'a mut Mailbox<T>,
+        _mailbox: &'a mut Mailbox<T>,
     ) -> BoxFuture<'a, Event> {
         let event = Event::new(*time, self.id, Action::Wait);
         Box::pin(async { event })
@@ -75,11 +73,11 @@ impl MessengerAgent {
 impl Agent<Box<&str>> for MessengerAgent {
     fn step<'a>(
         &'a mut self,
-        state: &'a mut Option<State>,
+        _state: &'a mut Option<State>,
         time: &f64,
         mailbox: &'a mut Mailbox<Box<&str>>,
     ) -> BoxFuture<'a, Event> {
-        let mailtome = mailbox
+        let _mailtome = mailbox
             .peek_messages()
             .iter()
             .filter(|m| m.to == self.id)
@@ -96,7 +94,7 @@ impl Agent<Box<&str>> for MessengerAgent {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::worlds::*;
     use super::*;

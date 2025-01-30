@@ -21,9 +21,9 @@ impl<T: Send + Sync + Clone + 'static> Universe<T> {
     /// Run all worlds in the universe in parallel.
     pub async fn run_parallel(
         &mut self,
-        live: bool,
-        logs: bool,
-        mail: bool,
+        _live: bool,
+        _logs: bool,
+        _mail: bool,
     ) -> Result<Vec<Result<(), SimError>>> {
         let mut handles = vec![];
         let worlds = std::mem::take(&mut self.worlds);
