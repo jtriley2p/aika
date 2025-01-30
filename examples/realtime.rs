@@ -1,5 +1,3 @@
-use aika::logger::*;
-use aika::universes::*;
 use aika::worlds::*;
 use aika::TestAgent;
 
