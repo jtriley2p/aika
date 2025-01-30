@@ -1,14 +1,16 @@
-
 use std::any::Any;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::collections::{BTreeMap, BTreeSet};
-use tokio::sync::{watch, mpsc::{channel, Sender, Receiver}};
 use tokio::io::AsyncBufReadExt;
-use std::cmp::Reverse;
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    watch,
+};
 
+use super::{Action, Agent, Clock, Config, Event, Loggable, Mailbox, Message, SimError};
 use crate::logger::Logger;
-use super::{Agent, Action, Clock, Config, Event, Loggable, Mailbox, Message, SimError};
 
 /// Thread-safe loggable generic state type
 pub type State = Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>;
@@ -344,4 +346,3 @@ impl<T: Send + Sync + Clone + 'static> World<T> {
         Ok(())
     }
 }
-
