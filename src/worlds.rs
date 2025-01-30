@@ -14,15 +14,15 @@ use tokio::sync::watch;
 use crate::logger::Logger;
 
 /// A message that can be sent between agents.
-pub struct Message {
-    pub data: Box<dyn Any + Send + Sync>,
+pub struct Message<T: Send + Sync + Clone> {
+    pub data: T,
     pub timestamp: f64,
     pub from: usize,
     pub to: usize,
 }
 
-impl Message {
-    pub fn new(data: Box<dyn Any + Send + Sync>, timestamp: f64, from: usize, to: usize) -> Self {
+impl<T: Send + Sync + Clone> Message<T> {
+    pub fn new(data: T, timestamp: f64, from: usize, to: usize) -> Self {
         Message {
             data,
             timestamp,
@@ -32,35 +32,35 @@ impl Message {
     }
 }
 
-impl PartialEq for Message {
+impl<T: Send + Sync + Clone> PartialEq for Message<T> {
     fn eq(&self, other: &Self) -> bool {
         self.timestamp == other.timestamp
     }
 }
 
-impl Eq for Message {}
+impl<T: Send + Sync + Clone> Eq for Message<T> {}
 
-impl PartialOrd for Message {
+impl<T: Send + Sync + Clone> PartialOrd for Message<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Message {
+impl<T: Send + Sync + Clone> Ord for Message<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.timestamp.partial_cmp(&other.timestamp).unwrap()
     }
 }
 
 /// A mailbox for agents to send and receive messages. WIP
-pub struct Mailbox {
-    tx: Sender<Message>,
-    rx: Receiver<Message>,
-    mailbox: Vec<Message>,
+pub struct Mailbox<T: Send + Sync + Clone> {
+    tx: Sender<Message<T>>,
+    rx: Receiver<Message<T>>,
+    mailbox: Vec<Message<T>>,
     pause_rx: watch::Receiver<bool>,
 }
 
-impl Mailbox {
+impl<T: Send + Sync + Clone> Mailbox<T> {
     pub fn new(buffer_size: usize, pause_rx: watch::Receiver<bool>) -> Self {
         let (tx, rx) = channel(buffer_size);
         Mailbox {
@@ -81,15 +81,15 @@ impl Mailbox {
         }
     }
 
-    pub async fn send(&self, msg: Message) -> Result<(), error::SendError<Message>> {
+    pub async fn send(&self, msg: Message<T>) -> Result<(), error::SendError<Message<T>>> {
         self.tx.send(msg).await
     }
 
-    pub async fn receive(&mut self) -> Option<Message> {
+    pub async fn receive(&mut self) -> Option<Message<T>> {
         self.rx.recv().await
     }
 
-    pub fn peek_messages(&self) -> &[Message] {
+    pub fn peek_messages(&self) -> &[Message<T>] {
         &self.mailbox
     }
 
@@ -101,17 +101,17 @@ impl Mailbox {
 }
 
 /// An agent that can be run in a simulation.
-pub trait Agent: Send {
+pub trait Agent<T: Send + Sync + Clone>: Send {
     fn step<'a>(
         &'a mut self,
         state: &'a mut Option<State>,
         time: &f64,
-        mailbox: &'a mut Mailbox,
+        mailbox: &'a mut Mailbox<T>,
     ) -> BoxFuture<'a, Event>;
     fn as_any(&self) -> &dyn Any;
 }
 
-pub trait Loggable: Agent {
+pub trait Loggable<T: Send + Sync + Clone>: Agent<T> {
     fn get_state(&self) -> State;
 }
 
@@ -197,12 +197,12 @@ pub enum ControlCommand {
 }
 
 /// A world that can contain multiple agents and run a simulation.
-pub struct World {
+pub struct World<T: Send + Sync + Clone> {
     overflow: BTreeSet<Reverse<Event>>,
     clock: Clock,
-    savedmail: BTreeSet<Message>,
-    agents: Vec<Box<dyn Agent>>,
-    mailbox: Mailbox,
+    savedmail: BTreeSet<Message<T>>,
+    agents: Vec<Box<dyn Agent<T>>>,
+    mailbox: Mailbox<T>,
     state: Option<State>,
     runtype: (bool, bool, bool, bool),
     runtime: Receiver<Event>,
@@ -212,8 +212,8 @@ pub struct World {
     pub logger: Logger,
 }
 
-unsafe impl Send for World {}
-unsafe impl Sync for World {}
+unsafe impl<T: Send + Sync + Clone> Send for World<T> {}
+unsafe impl<T: Send + Sync + Clone> Sync for World<T> {}
 
 /// Configuration for the world
 #[derive(Clone)]
@@ -252,7 +252,7 @@ impl Config {
     }
 }
 
-impl World {
+impl<T: Send + Sync + Clone + 'static> World<T> {
     /// Create a new world with the given configuration.
     /// By default, this will include a toggleable CLI for real-time simulation control, a logger for state logging, an asynchronous runtime, and a mailbox for message passing between agents.
     pub fn create(config: Config) -> Self {
@@ -275,7 +275,7 @@ impl World {
         }
     }
     /// Spawn a new agent into the world.
-    pub fn spawn(&mut self, agent: Box<dyn Agent>) -> usize {
+    pub fn spawn(&mut self, agent: Box<dyn Agent<T>>) -> usize {
         self.agents.push(agent);
         self.agents.len() - 1
     }
@@ -327,7 +327,7 @@ impl World {
         });
     }
 
-    fn log_mail(&mut self, msg: Message) {
+    fn log_mail(&mut self, msg: Message<T>) {
         self.savedmail.insert(msg);
     }
 
@@ -487,7 +487,7 @@ impl World {
                                 .enumerate()
                                 .filter_map(|(i, agt)| {
                                     agt.as_any()
-                                        .downcast_ref::<Box<dyn Loggable>>()
+                                        .downcast_ref::<Box<dyn Loggable<T>>>()
                                         .map(|loggable| (i, loggable.get_state()))
                                 })
                                 .collect();

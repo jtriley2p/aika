@@ -5,17 +5,17 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use super::worlds::*;
 
 /// A universe is a collection of worlds that can be run in parallel.
-pub struct Universe {
-    pub worlds: Vec<World>,
+pub struct Universe<T: Send + Sync + Clone> {
+    pub worlds: Vec<World<T>>,
 }
 
-impl Universe {
+impl<T: Send + Sync + Clone + 'static> Universe<T> {
     /// Create a new universe.
     pub fn new() -> Self {
         Universe { worlds: Vec::new() }
     }
     /// Add a world to the universe.
-    pub fn add_world(&mut self, world: World) {
+    pub fn add_world(&mut self, world: World<T>) {
         self.worlds.push(world);
     }
     /// Run all worlds in the universe in parallel.
