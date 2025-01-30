@@ -1,7 +1,5 @@
-use std::sync::{Arc, Mutex};
-
 use futures::future::BoxFuture;
-use worlds::{Action, Agent, Event, Loggable, Mailbox, Message, State};
+use worlds::{Action, Agent, Event, Mailbox, Message, State};
 
 extern crate tokio;
 
@@ -20,12 +18,12 @@ impl TestAgent {
     }
 }
 
-impl Agent for TestAgent {
+impl<T: Send + Sync + Clone> Agent<T> for TestAgent {
     fn step<'a>(
         &'a mut self,
-        state: &'a mut Option<State>,
+        _state: &'a mut Option<State>,
         time: &f64,
-        mailbox: &'a mut Mailbox,
+        _mailbox: &'a mut Mailbox<T>,
     ) -> BoxFuture<'a, Event> {
         let event = Event::new(*time, self.id, Action::Timeout(1.0));
         Box::pin(async { event })
@@ -46,12 +44,12 @@ impl SingleStepAgent {
     }
 }
 
-impl Agent for SingleStepAgent {
+impl<T: Send + Sync + Clone> Agent<T> for SingleStepAgent {
     fn step<'a>(
         &'a mut self,
-        state: &'a mut Option<State>,
+        _state: &'a mut Option<State>,
         time: &f64,
-        mailbox: &'a mut Mailbox,
+        _mailbox: &'a mut Mailbox<T>,
     ) -> BoxFuture<'a, Event> {
         let event = Event::new(*time, self.id, Action::Wait);
         Box::pin(async { event })
@@ -72,14 +70,14 @@ impl MessengerAgent {
     }
 }
 
-impl Agent for MessengerAgent {
+impl Agent<Box<&str>> for MessengerAgent {
     fn step<'a>(
         &'a mut self,
-        state: &'a mut Option<State>,
+        _state: &'a mut Option<State>,
         time: &f64,
-        mailbox: &'a mut Mailbox,
+        mailbox: &'a mut Mailbox<Box<&str>>,
     ) -> BoxFuture<'a, Event> {
-        let mailtome = mailbox
+        let _mailtome = mailbox
             .peek_messages()
             .iter()
             .filter(|m| m.to == self.id)
@@ -96,7 +94,7 @@ impl Agent for MessengerAgent {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::worlds::*;
     use super::*;
@@ -104,7 +102,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_run() {
         let config = Config::new(1.0, Some(2000000.0), 100, 100, false, false, false, false);
-        let mut world = World::create(config);
+        let mut world = World::<()>::create(config);
         let agent_test = TestAgent::new(0, "Test".to_string());
         world.spawn(Box::new(agent_test));
         world.schedule(0.0, 0).unwrap();
@@ -119,7 +117,7 @@ mod tests {
 
         // minimal config world, no logs, no mail, no live for base processing speed benchmark
         let config = Config::new(timestep, terminal, 1000, 1000, false, false, false, false);
-        let mut world = World::create(config);
+        let mut world = World::<()>::create(config);
 
         let agent = TestAgent::new(0, format!("Test{}", 0));
         world.spawn(Box::new(agent));
@@ -147,7 +145,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_periphery() {
         let config = Config::new(1.0, Some(1000.0), 100, 100, false, true, false, false);
-        let mut world = World::create(config);
+        let mut world = World::<()>::create(config);
         let agent_test = SingleStepAgent::new(0, "Test".to_string());
         world.spawn(Box::new(agent_test));
         world.schedule(0.0, 0).unwrap();
