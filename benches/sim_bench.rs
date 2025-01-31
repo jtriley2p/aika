@@ -7,9 +7,9 @@ use std::hint::black_box;
 use tokio::runtime::Runtime;
 
 async fn run_sim(id: usize, config: Config) {
-    let mut world = World::<()>::create(config);
-    let agent = TestAgent::new(id, format!("Test{}", id));
-    world.spawn(Box::new(agent));
+    let mut world = World::<(), ()>::create(config);
+    let mut agent = TestAgent::new(id, format!("Test{}", id));
+    world.spawn(&mut agent);
     world.schedule(0.0, id).unwrap();
 
     world.run().await.unwrap();

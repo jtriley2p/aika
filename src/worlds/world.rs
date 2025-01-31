@@ -1,6 +1,5 @@
-use std::any::Any;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
@@ -9,11 +8,12 @@ use tokio::sync::{
     watch,
 };
 
-use super::{Action, Agent, Clock, Config, Event, Loggable, Mailbox, Message, SimError};
+use super::agent::AgentState;
+use super::{Action, Agent, Clock, Config, Event, Mailbox, Message, SimError};
 use crate::logger::Logger;
 
 /// Thread-safe loggable generic state type
-pub type State = Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>;
+pub type State<U: Send + Sync + Clone> = Arc<Mutex<U>>;
 
 /// Control commands for the real-time simulation
 pub enum ControlCommand {
@@ -25,25 +25,25 @@ pub enum ControlCommand {
 }
 
 /// A world that can contain multiple agents and run a simulation.
-pub struct World<T: Send + Sync + Clone> {
+pub struct World<U: Send + Sync + Clone + 'static, T: Send + Sync + Clone + 'static> {
     overflow: BTreeSet<Reverse<Event>>,
     clock: Clock,
     _savedmail: BTreeSet<Message<T>>,
-    agents: Vec<Box<dyn Agent<T>>>,
+    agents: Vec<&'static mut dyn Agent<U, T>>,
     mailbox: Mailbox<T>,
-    state: Option<State>,
+    state: Option<State<U>>,
     runtype: (bool, bool, bool, bool),
     runtime: Receiver<Event>,
     pub sender: Sender<Event>,
     pub pause_tx: watch::Sender<bool>,
     pub pause_rx: watch::Receiver<bool>,
-    pub logger: Logger,
+    pub logger: Logger<U>,
 }
 
-unsafe impl<T: Send + Sync + Clone> Send for World<T> {}
-unsafe impl<T: Send + Sync + Clone> Sync for World<T> {}
+unsafe impl<U: Send + Sync + Clone, T: Send + Sync + Clone> Send for World<U, T> {}
+unsafe impl<U: Send + Sync + Clone, T: Send + Sync + Clone> Sync for World<U, T> {}
 
-impl<T: Send + Sync + Clone + 'static> World<T> {
+impl<U: Send + Sync + Clone, T: Send + Sync + Clone + 'static> World<U, T> {
     /// Create a new world with the given configuration.
     /// By default, this will include a toggleable CLI for real-time simulation control, a logger for state logging, an asynchronous runtime, and a mailbox for message passing between agents.
     pub fn create(config: Config) -> Self {
@@ -66,7 +66,7 @@ impl<T: Send + Sync + Clone + 'static> World<T> {
         }
     }
     /// Spawn a new agent into the world.
-    pub fn spawn(&mut self, agent: Box<dyn Agent<T>>) -> usize {
+    pub fn spawn(&mut self, agent: &'static mut dyn Agent<U, T>) -> usize {
         self.agents.push(agent);
         self.agents.len() - 1
     }
@@ -157,7 +157,7 @@ impl<T: Send + Sync + Clone + 'static> World<T> {
         self.clock.time.step
     }
     /// Clone the current state of the simulation.
-    pub fn state(&self) -> Option<State> {
+    pub fn state(&self) -> Option<State<U>> {
         self.state.clone()
     }
 
@@ -269,17 +269,13 @@ impl<T: Send + Sync + Clone + 'static> World<T> {
                             .step(&mut self.state, &event.time, &mut self.mailbox)
                             .await;
                         if self.runtype.1 {
-                            let agent_states: BTreeMap<
-                                usize,
-                                Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>,
+                            let agent_states: Vec<&dyn AgentState,
                             > = self
                                 .agents
                                 .iter()
                                 .enumerate()
                                 .filter_map(|(i, agt)| {
-                                    agt.as_any()
-                                        .downcast_ref::<Box<dyn Loggable<T>>>()
-                                        .map(|loggable| (i, loggable.get_state()))
+                                    Some(agt.get_state())
                                 })
                                 .collect();
                             self.logger.log(

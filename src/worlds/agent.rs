@@ -1,19 +1,16 @@
 use futures::future::BoxFuture;
-use std::any::Any;
 
 use super::{Event, Mailbox, State};
 
 /// An agent that can be run in a simulation.
-pub trait Agent<T: Send + Sync + Clone>: Send {
+pub trait Agent<U: Send + Sync + Clone, T: Send + Sync + Clone>: Send {
     fn step<'a>(
         &'a mut self,
-        state: &'a mut Option<State>,
+        state: &'a mut Option<State<U>>,
         time: &f64,
         mailbox: &'a mut Mailbox<T>,
     ) -> BoxFuture<'a, Event>;
-    fn as_any(&self) -> &dyn Any;
+    fn get_state<'a>(&self) -> &'a dyn AgentState;
 }
 
-pub trait Loggable<T: Send + Sync + Clone>: Agent<T> {
-    fn get_state(&self) -> State;
-}
+pub trait AgentState: Send + Sync {}
